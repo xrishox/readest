@@ -96,6 +96,31 @@ const QUALITY_RANK: Record<string, number> = { premium: 0, enhanced: 1 };
 export const compareVoiceQuality = (a: { quality?: string }, b: { quality?: string }): number =>
   (QUALITY_RANK[a.quality ?? ''] ?? 2) - (QUALITY_RANK[b.quality ?? ''] ?? 2);
 
+// Parse a GET /v1/audio/voices/all response ({ voices: [{ id, name, lang,
+// quality? }] }). Servers that wrap plain system voices (e.g. a macOS speech
+// server) omit `quality` or send a blanket 'default' even though the tier is
+// encoded in the Apple voice id — derive it there so the picker's badges and
+// quality-first ordering work either way. Malformed entries are dropped; an
+// empty result tells fetchVoices to fall back to the flat /v1/audio/voices
+// list.
+export const parseOpenAITTSVoicesAll = (data: unknown): OpenAITTSVoice[] => {
+  const list = (data as { voices?: unknown } | null)?.voices;
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter(
+      (v): v is OpenAITTSVoice =>
+        !!v &&
+        typeof (v as OpenAITTSVoice).id === 'string' &&
+        typeof (v as OpenAITTSVoice).name === 'string' &&
+        typeof (v as OpenAITTSVoice).lang === 'string',
+    )
+    .map((v) => {
+      if (v.quality && v.quality !== 'default') return v;
+      const derived = inferVoiceFromId(v.id).quality;
+      return derived ? { ...v, quality: derived } : v;
+    });
+};
+
 // Extract model ids from an OpenAI-style GET /v1/models response
 // ({ object: 'list', data: [{ id, ... }, ...] }).
 export const parseOpenAITTSModelIds = (data: unknown): string[] => {
@@ -215,14 +240,7 @@ export class OpenAISpeechTTS {
         VOICES_TIMEOUT_MS,
       );
       if (response.ok) {
-        const data = (await response.json()) as { voices?: unknown[] };
-        const voices = (data.voices ?? []).filter(
-          (v): v is OpenAITTSVoice =>
-            !!v &&
-            typeof (v as OpenAITTSVoice).id === 'string' &&
-            typeof (v as OpenAITTSVoice).name === 'string' &&
-            typeof (v as OpenAITTSVoice).lang === 'string',
-        );
+        const voices = parseOpenAITTSVoicesAll(await response.json());
         if (voices.length > 0) return voices;
       }
     } catch (err) {
