@@ -63,8 +63,12 @@ class AsyncQueue<T> {
 // Voice label shown in the picker: name plus locale so region variants of the
 // same primary language stay distinguishable (the list is filtered by primary
 // language only), e.g. 'Zoe — en-US'. The quality tier renders as a separate
-// badge (TTSVoice.quality), not as part of the name.
-const formatVoiceName = (voice: OpenAITTSVoice): string => `${voice.name} — ${voice.lang}`;
+// badge (TTSVoice.quality), not as part of the name — Apple display names
+// already embed '(Premium)'/'(Enhanced)', which would duplicate the badge.
+const formatVoiceName = (voice: OpenAITTSVoice): string => {
+  const name = voice.name.replace(/\s*\((?:premium|enhanced)\)\s*$/i, '');
+  return `${name} — ${voice.lang}`;
+};
 
 const voiceQualityTier = (quality?: string): TTSVoice['quality'] =>
   quality === 'premium' || quality === 'enhanced' ? quality : undefined;
