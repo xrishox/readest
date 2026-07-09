@@ -7,7 +7,7 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { saveViewSettings } from '@/helpers/settings';
 import { SettingsPanelPanelProp } from './SettingsDialog';
 import { TTSHighlightGranularity, TTSMediaMetadataMode } from '@/services/tts/types';
-import { BoxedList, SettingsRow, SettingsSelect } from './primitives';
+import { BoxedList, SettingsInput, SettingsRow, SettingsSelect, Tips } from './primitives';
 import TTSHighlightStyleEditor, { TTSHighlightStyle } from './color/TTSHighlightStyleEditor';
 
 const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }) => {
@@ -31,6 +31,12 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
   );
   const [customTtsHighlightColors, setCustomTtsHighlightColors] = useState(
     settings.globalReadSettings.customTtsHighlightColors || [],
+  );
+  const [openaiTtsEndpoint, setOpenaiTtsEndpoint] = useState(
+    settings.globalReadSettings.openaiTtsEndpoint || '',
+  );
+  const [openaiTtsApiKey, setOpenaiTtsApiKey] = useState(
+    settings.globalReadSettings.openaiTtsApiKey || '',
   );
 
   const resetToDefaults = useResetViewSettings();
@@ -99,6 +105,21 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
     setTtsHighlightGranularity(granularity);
   };
 
+  // Persisted on blur; the OpenAI-compatible client reads these the next time
+  // Read Aloud starts (TTSController.init constructs the client from them).
+  const saveOpenaiTtsSettings = (endpoint: string, apiKey: string) => {
+    if (
+      endpoint === settings.globalReadSettings.openaiTtsEndpoint &&
+      apiKey === settings.globalReadSettings.openaiTtsApiKey
+    ) {
+      return;
+    }
+    settings.globalReadSettings.openaiTtsEndpoint = endpoint;
+    settings.globalReadSettings.openaiTtsApiKey = apiKey;
+    setSettings(settings);
+    saveSettings(envConfig, settings);
+  };
+
   return (
     <div className='my-4 w-full space-y-6'>
       <TTSHighlightStyleEditor
@@ -127,6 +148,43 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
           />
         </SettingsRow>
       </BoxedList>
+
+      <BoxedList title={_('OpenAI-Compatible TTS')} data-setting-id='settings.tts.openaiCompatible'>
+        <SettingsRow label={_('Endpoint')}>
+          <SettingsInput
+            type='url'
+            value={openaiTtsEndpoint}
+            placeholder='http://localhost:8787'
+            spellCheck={false}
+            autoCapitalize='off'
+            autoCorrect='off'
+            aria-label={_('Endpoint')}
+            onChange={(e) => setOpenaiTtsEndpoint(e.target.value)}
+            onBlur={() => saveOpenaiTtsSettings(openaiTtsEndpoint.trim(), openaiTtsApiKey)}
+          />
+        </SettingsRow>
+        <SettingsRow label={_('API Key')}>
+          <SettingsInput
+            type='password'
+            value={openaiTtsApiKey}
+            placeholder={_('Optional')}
+            spellCheck={false}
+            autoCapitalize='off'
+            autoCorrect='off'
+            aria-label={_('API Key')}
+            onChange={(e) => setOpenaiTtsApiKey(e.target.value)}
+            onBlur={() => saveOpenaiTtsSettings(openaiTtsEndpoint.trim(), openaiTtsApiKey.trim())}
+          />
+        </SettingsRow>
+      </BoxedList>
+      <Tips>
+        <li>
+          {_(
+            'Point this at a self-hosted OpenAI-compatible speech server to add its voices to Read Aloud.',
+          )}
+        </li>
+        <li>{_('Changes take effect the next time Read Aloud starts.')}</li>
+      </Tips>
     </div>
   );
 };
