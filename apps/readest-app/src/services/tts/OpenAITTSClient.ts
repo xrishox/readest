@@ -3,9 +3,11 @@ import { isSameLang } from '@/utils/lang';
 import { TTSClient, TTSMessageEvent } from './TTSClient';
 import {
   compareVoiceQuality,
+  OpenAITTSAudioData,
   OpenAISpeechTTS,
   OpenAITTSPayload,
   OpenAITTSRequestError,
+  OpenAITTSResponseFormat,
   OpenAITTSVoice,
 } from '@/libs/openaiTTS';
 import { TTSGranularity, TTSMark, TTSVoice, TTSVoicesGroup } from './types';
@@ -18,23 +20,38 @@ import { applyEdgeFade, findSpeechBounds } from './pcm';
 import { timeStretch } from './timeStretch';
 import { calibrateVoiceRate, recordMeasuredDuration } from './ttsDuration';
 import { TTSAudioBuffer, WebAudioPlayer, WebAudioPlayerEvent } from './WebAudioPlayer';
+import {
+  decodeOpenAITTSAudioWithFallback,
+  OpenAITTSCodecNegotiator,
+  OpenAITTSFetchedAudio,
+} from './openaiTTSCodec';
+import {
+  OpenAITTSFetchPriority,
+  OpenAITTSOrderedWindow,
+  OpenAITTSTaskPool,
+} from './openaiTTSWindow';
 
 // OpenAI-compatible TTS client for a self-hosted server (endpoint + optional
 // API key configured in Settings -> TTS). Mirrors EdgeTTSClient's playback
-// pipeline: fetch WAV (cached at speed 1.0) -> decode -> trim silence ->
-// WSOLA time-stretch to the playback rate -> schedule gaplessly on the shared
-// AudioContext. Marks are dispatched when a chunk becomes AUDIBLE, not when
-// it is fetched. The server reports no word boundaries, so granularity and
-// highlighting stay sentence-level.
+// pipeline: probe + fetch Ogg Opus/AAC-LC/WAV (cached at speed 1.0) -> decode
+// -> trim silence -> WSOLA time-stretch to the playback rate -> schedule
+// gaplessly on the shared AudioContext. Fetching runs in an ordered current +
+// nine window; decoding stays behind player backpressure. Marks are dispatched
+// when a chunk becomes AUDIBLE, not when it is fetched. The server reports no
+// word boundaries, so granularity and highlighting stay sentence-level.
 
 const INTER_SENTENCE_GAP_SEC = 0.15;
-const RESPONSE_FORMAT = 'wav';
 const DEFAULT_MODEL = 'tts-1';
 
 interface ChunkMeta {
   mark: TTSMark;
   trimStartSec: number;
   trimmedDurationSec: number;
+}
+
+interface FetchedMarkAudio extends OpenAITTSFetchedAudio {
+  mark: TTSMark;
+  voiceId: string;
 }
 
 type SpeakQueueEvent =
@@ -73,6 +90,29 @@ const formatVoiceName = (voice: OpenAITTSVoice): string => {
 const voiceQualityTier = (quality?: string): TTSVoice['quality'] =>
   quality === 'premium' || quality === 'enhanced' ? quality : undefined;
 
+const abortError = (signal: AbortSignal): Error => {
+  if (signal.reason instanceof Error) return signal.reason;
+  return new DOMException('Aborted', 'AbortError');
+};
+
+const waitForRetry = (delayMs: number, signal: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError(signal));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(abortError(signal));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+
 export class OpenAITTSClient implements TTSClient {
   name = 'openai-tts';
   initialized = false;
@@ -86,8 +126,12 @@ export class OpenAITTSClient implements TTSClient {
   #rate = 1.0;
 
   #openaiTTS: OpenAISpeechTTS | null = null;
+  #codec: OpenAITTSCodecNegotiator | null = null;
   #model = DEFAULT_MODEL;
   #player = new WebAudioPlayer();
+  #fetchPool = new OpenAITTSTaskPool();
+  #activeFetchController: AbortController | null = null;
+  #preloadControllers = new Set<AbortController>();
   #activeGeneration: number | null = null;
   #activeQueue: AsyncQueue<SpeakQueueEvent> | null = null;
   #chunkMeta: ChunkMeta[] = [];
@@ -108,6 +152,7 @@ export class OpenAITTSClient implements TTSClient {
       return false;
     }
     this.#openaiTTS = new OpenAISpeechTTS(endpoint, readSettings?.openaiTtsApiKey || '');
+    this.#codec = new OpenAITTSCodecNegotiator((data) => this.#player.decode(data));
     this.#model = readSettings?.openaiTtsModel?.trim() || DEFAULT_MODEL;
     if (await this.#openaiTTS.checkAvailability()) {
       const voices = await this.#openaiTTS.fetchVoices();
@@ -125,43 +170,83 @@ export class OpenAITTSClient implements TTSClient {
     return this.initialized;
   }
 
-  getPayload = (text: string, voiceId: string): OpenAITTSPayload => {
+  getPayload = (
+    text: string,
+    voiceId: string,
+    responseFormat: OpenAITTSResponseFormat = 'opus',
+  ): OpenAITTSPayload => {
     // Speed stays 1.0 so the audio cache is rate-independent; the playback
     // rate is applied client-side via time-stretch.
     return {
       model: this.#model,
       text,
       voice: voiceId,
-      responseFormat: RESPONSE_FORMAT,
+      responseFormat,
       speed: 1.0,
     };
   };
 
-  // Transient failures (network hiccup, 5xx) retry a few times before giving
-  // up. 4xx responses are permanent for a given sentence/voice
-  // (OpenAITTSRequestError), so they rethrow immediately for the caller's
-  // skip path.
+  // Transient failures (network hiccup, 429, 5xx) retry a few times before
+  // giving up. Other HTTP failures rethrow immediately; the scheduler alone
+  // decides whether a 400/422 is safe to skip or must stop the session.
   #createAudioDataWithRetry = async (
     payload: OpenAITTSPayload,
     signal: AbortSignal,
     maxAttempts = 3,
-  ): Promise<ArrayBuffer | undefined> => {
+  ): Promise<OpenAITTSAudioData> => {
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (signal.aborted) return undefined;
+      if (signal.aborted) throw abortError(signal);
       try {
-        return await this.#openaiTTS?.createAudioData(payload, signal);
+        if (!this.#openaiTTS) throw new Error('OpenAI TTS client is not initialized.');
+        return await this.#openaiTTS.createAudioData(payload, signal);
       } catch (err) {
-        if (err instanceof OpenAITTSRequestError) throw err;
+        if (err instanceof OpenAITTSRequestError && (err.isUnsupportedFormat || !err.isRetryable)) {
+          throw err;
+        }
         lastError = err;
         console.warn(`OpenAI TTS fetch attempt ${attempt}/${maxAttempts} failed`, err);
         if (attempt < maxAttempts && !signal.aborted) {
-          await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+          await waitForRetry(200 * attempt, signal);
         }
       }
     }
     throw lastError;
   };
+
+  #fetchMark = (
+    mark: TTSMark,
+    signal: AbortSignal,
+    priority: OpenAITTSFetchPriority,
+  ): Promise<FetchedMarkAudio> =>
+    this.#fetchPool.run(
+      async () => {
+        const codec = this.#codec;
+        if (!codec) throw new Error('OpenAI TTS codec negotiation is not initialized.');
+        const voiceId = await this.getVoiceIdFromLang(mark.language);
+        for (;;) {
+          if (signal.aborted) throw abortError(signal);
+          const format = await codec.nextFormat();
+          const payload = this.getPayload(mark.text, voiceId, format);
+          try {
+            const audio = await this.#createAudioDataWithRetry(payload, signal);
+            return { mark, voiceId, format, payload, audio };
+          } catch (error) {
+            if (error instanceof OpenAITTSRequestError && error.isUnsupportedFormat) {
+              codec.reject(format);
+              continue;
+            }
+            // Another concurrent job may have explicitly rejected this codec
+            // while this request was retrying. Follow that established result;
+            // this error itself still does not cause a downgrade.
+            if (!codec.accepts(format)) continue;
+            throw error;
+          }
+        }
+      },
+      signal,
+      priority,
+    );
 
   getVoiceIdFromLang = async (lang: string) => {
     const preferredVoiceId = TTSUtils.getPreferredVoice(this.name, lang);
@@ -203,7 +288,13 @@ export class OpenAITTSClient implements TTSClient {
     await this.#player.ensureContext();
     this.#isPlaying = true;
 
-    this.#runScheduler(marks, signal, generation, queue, chunkMeta);
+    const fetchController = new AbortController();
+    const abortFetches = () => fetchController.abort(signal.reason);
+    if (signal.aborted) abortFetches();
+    else signal.addEventListener('abort', abortFetches, { once: true });
+    this.#activeFetchController = fetchController;
+
+    this.#runScheduler(marks, fetchController.signal, generation, queue, chunkMeta);
 
     let abortHandler: (() => void) | null = null;
     try {
@@ -234,14 +325,21 @@ export class OpenAITTSClient implements TTSClient {
           yield { code: 'end', message: 'Speak finished' } as TTSMessageEvent;
           return;
         } else {
-          yield { code: 'error', message: event.message } as TTSMessageEvent;
-          return;
+          // Unlike the native client, transport/config failures are not
+          // skippable engine events. Throw so TTSController.error() stops the
+          // session visibly instead of leaving controls in a playing state.
+          throw new Error(event.message);
         }
       }
     } finally {
       // The controller aborts the signal after every successful paragraph; a
       // lingering listener would push a stale 'Aborted' into a dead queue.
       if (abortHandler) signal.removeEventListener('abort', abortHandler);
+      signal.removeEventListener('abort', abortFetches);
+      fetchController.abort(new DOMException('Speech session ended', 'AbortError'));
+      if (this.#activeFetchController === fetchController) {
+        this.#activeFetchController = null;
+      }
       this.#isPlaying = false;
       if (this.#activeGeneration === generation) {
         this.#activeGeneration = null;
@@ -252,34 +350,24 @@ export class OpenAITTSClient implements TTSClient {
   }
 
   async *#preload(marks: TTSMark[], signal: AbortSignal) {
-    // Fetch the first couple of marks immediately and the rest in the
-    // background; the in-flight dedup in OpenAISpeechTTS keeps this from
-    // racing duplicate requests against the playback scheduler.
-    const maxImmediate = 2;
-    for (let i = 0; i < Math.min(maxImmediate, marks.length); i++) {
-      if (signal.aborted) break;
-      const mark = marks[i]!;
-      const voiceId = await this.getVoiceIdFromLang(mark.language);
-      this.#currentVoiceId = voiceId;
+    // Do not create/resume an AudioContext merely for speculative preload: on
+    // Apple platforms the initial codec probe must run in the playback context
+    // warmed by the user gesture. Once playback has pinned a codec, warm only
+    // the nearest mark and await it—never launch detached, uncancellable work.
+    const mark = marks[0];
+    if (mark && this.#codec?.pinnedFormat && !signal.aborted) {
+      const controller = new AbortController();
+      const relayAbort = () => controller.abort(signal.reason);
+      signal.addEventListener('abort', relayAbort, { once: true });
+      this.#preloadControllers.add(controller);
       try {
-        await this.#createAudioDataWithRetry(this.getPayload(mark.text, voiceId), signal);
+        await this.#fetchMark(mark, controller.signal, 'preload');
       } catch (err) {
-        console.warn('Error preloading mark', i, err);
+        if (!controller.signal.aborted) console.warn('Error preloading nearest mark', err);
+      } finally {
+        signal.removeEventListener('abort', relayAbort);
+        this.#preloadControllers.delete(controller);
       }
-    }
-    if (marks.length > maxImmediate) {
-      (async () => {
-        for (let i = maxImmediate; i < marks.length; i++) {
-          const mark = marks[i]!;
-          try {
-            if (signal.aborted) break;
-            const voiceId = await this.getVoiceIdFromLang(mark.language);
-            await this.#createAudioDataWithRetry(this.getPayload(mark.text, voiceId), signal);
-          } catch (err) {
-            console.warn('Error preloading mark (bg)', i, err);
-          }
-        }
-      })();
     }
 
     yield {
@@ -288,9 +376,9 @@ export class OpenAITTSClient implements TTSClient {
     } as TTSMessageEvent;
   }
 
-  // Detached scheduler: fetches, prepares, and schedules chunks ahead of the
-  // playhead under the player's backpressure. Never throws; failures surface
-  // through the event queue.
+  // Detached from the event generator, but fully owned by its generation and
+  // abort controller. Fetches stay ten-wide and ordered; decoding waits for
+  // player capacity so speculative work retains compressed bytes, not PCM.
   async #runScheduler(
     marks: TTSMark[],
     signal: AbortSignal,
@@ -299,21 +387,23 @@ export class OpenAITTSClient implements TTSClient {
     chunkMeta: ChunkMeta[],
   ): Promise<void> {
     const rate = this.#rate;
+    const window = new OpenAITTSOrderedWindow<TTSMark, FetchedMarkAudio>({
+      items: marks,
+      signal,
+      load: (mark) => this.#fetchMark(mark, signal, 'playback'),
+    });
+    let markIndex = 0;
     try {
-      for (const mark of marks) {
+      while (markIndex < marks.length) {
+        const mark = marks[markIndex++]!;
         if (signal.aborted || this.#activeGeneration !== generation) return;
-        // Voices resolve per mark: mixed-language sections speak (and record
-        // durations under) the voice actually used for each sentence.
-        const voiceId = await this.getVoiceIdFromLang(mark.language);
-        this.#speakingLang = mark.language;
-        this.#currentVoiceId = voiceId;
-        const payload = this.getPayload(mark.text, voiceId);
-
-        let audio: ArrayBuffer | undefined;
+        let fetched: FetchedMarkAudio;
         try {
-          audio = await this.#createAudioDataWithRetry(payload, signal);
+          const next = await window.next();
+          if (!next) break;
+          fetched = next.value;
         } catch (error) {
-          if (error instanceof OpenAITTSRequestError) {
+          if (error instanceof OpenAITTSRequestError && error.isSkippableInput) {
             // Permanent for this sentence (bad voice, unsynthesizable text):
             // skip it instead of dead-ending the session.
             console.warn('OpenAI TTS rejected mark:', mark.text, error.message);
@@ -326,7 +416,42 @@ export class OpenAITTSClient implements TTSClient {
           queue.push({ kind: 'error', message });
           return;
         }
-        if (!audio || signal.aborted || this.#activeGeneration !== generation) return;
+        if (signal.aborted || this.#activeGeneration !== generation) return;
+
+        // Wait before decoding so at most the player's near-playback budget is
+        // expanded to PCM. The window has already admitted the next compressed
+        // fetch, preserving network lookahead while this chunk waits.
+        const ready = await this.#player.waitUntilReady(generation);
+        if (!ready || signal.aborted) return;
+
+        let decoded: { fetched: FetchedMarkAudio; decoded: TTSAudioBuffer };
+        try {
+          decoded = await decodeOpenAITTSAudioWithFallback(fetched, {
+            negotiator: this.#codec!,
+            decode: (data) => this.#player.decode(data),
+            refetch: () => this.#fetchMark(mark, signal, 'playback'),
+            evict: (payload) => this.#openaiTTS?.evictAudio(payload),
+          });
+        } catch (error) {
+          if (signal.aborted || this.#activeGeneration !== generation) return;
+          if (error instanceof OpenAITTSRequestError && error.isSkippableInput) {
+            console.warn(
+              'OpenAI TTS rejected mark during codec fallback:',
+              mark.text,
+              error.message,
+            );
+            queue.push({ kind: 'chunk-skip', markName: mark.name });
+            continue;
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn('Failed to obtain decodable TTS audio for:', mark.text, message);
+          queue.push({ kind: 'error', message });
+          return;
+        }
+
+        const { voiceId } = decoded.fetched;
+        this.#speakingLang = mark.language;
+        this.#currentVoiceId = voiceId;
 
         let prepared: {
           buffer: TTSAudioBuffer;
@@ -334,10 +459,11 @@ export class OpenAITTSClient implements TTSClient {
           trimmedDurationSec: number;
         };
         try {
-          prepared = await this.#prepareChunkBuffer(audio, rate);
+          prepared = await this.#prepareChunkBuffer(decoded.decoded, rate);
         } catch (error) {
-          // Malformed audio must not dead-end the session: same UX as no-audio.
-          console.warn('Failed to decode TTS audio for:', mark.text, error);
+          // The codec has already decoded successfully. A later PCM/WSOLA
+          // failure is not evidence that the container is unsupported.
+          console.warn('Failed to prepare TTS audio for:', mark.text, error);
           queue.push({ kind: 'chunk-skip', markName: mark.name });
           continue;
         }
@@ -346,8 +472,6 @@ export class OpenAITTSClient implements TTSClient {
         recordMeasuredDuration(voiceId, mark.text, prepared.trimmedDurationSec);
         calibrateVoiceRate(voiceId, mark.text, prepared.trimmedDurationSec);
 
-        const ready = await this.#player.waitUntilReady(generation);
-        if (!ready || signal.aborted) return;
         chunkMeta.push({
           mark,
           trimStartSec: prepared.trimStartSec,
@@ -371,13 +495,12 @@ export class OpenAITTSClient implements TTSClient {
   }
 
   async #prepareChunkBuffer(
-    data: ArrayBuffer,
+    decoded: TTSAudioBuffer,
     rate: number,
   ): Promise<{ buffer: TTSAudioBuffer; trimStartSec: number; trimmedDurationSec: number }> {
     // decodeAudioData resamples to the context rate (44.1/48kHz on real
     // devices, not the stream's 22.05kHz) — all math below must use the
     // decoded buffer's sampleRate.
-    const decoded = await this.#player.decode(data);
     const sampleRate = decoded.sampleRate;
     const channel = decoded.getChannelData(0);
     const bounds = findSpeechBounds(channel, sampleRate);
@@ -415,6 +538,12 @@ export class OpenAITTSClient implements TTSClient {
 
   private async stopInternal() {
     this.#isPlaying = false;
+    this.#activeFetchController?.abort(new DOMException('Speech session stopped', 'AbortError'));
+    this.#activeFetchController = null;
+    for (const controller of this.#preloadControllers) {
+      controller.abort(new DOMException('Preload generation stopped', 'AbortError'));
+    }
+    this.#preloadControllers.clear();
     if (this.#activeGeneration !== null) {
       this.#activeGeneration = null;
       // Unblock a generator awaiting the queue; without this a stop() outside
