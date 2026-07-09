@@ -61,6 +61,14 @@ export interface ReadSettings {
    * silently; users download them explicitly from the Word Lens sub-page.
    */
   wordLensAutoDownload: boolean;
+  /**
+   * Base URL of a self-hosted OpenAI-compatible TTS server (e.g.
+   * `http://mac:8787`), with or without a trailing `/v1`. Empty disables the
+   * OpenAI-compatible TTS client entirely (it never probes the network).
+   */
+  openaiTtsEndpoint: string;
+  /** Optional API key; sent as `Authorization: Bearer <key>` when non-empty. */
+  openaiTtsApiKey: string;
   highlightStyle: HighlightStyle;
   highlightStyles: Record<HighlightStyle, HighlightColor>;
 

@@ -13,6 +13,7 @@ import { createRejectFilter } from '@/utils/node';
 import { WebSpeechClient } from './WebSpeechClient';
 import { NativeTTSClient } from './NativeTTSClient';
 import { EdgeTTSClient } from './EdgeTTSClient';
+import { OpenAITTSClient } from './OpenAITTSClient';
 import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { TTSUtils } from './TTSUtils';
 import { TTSClient } from './TTSClient';
@@ -151,9 +152,11 @@ export class TTSController extends EventTarget {
   ttsClient: TTSClient;
   ttsWebClient: TTSClient;
   ttsEdgeClient: TTSClient;
+  ttsOpenAIClient: TTSClient;
   ttsNativeClient: TTSClient | null = null;
   ttsWebVoices: TTSVoice[] = [];
   ttsEdgeVoices: TTSVoice[] = [];
+  ttsOpenAIVoices: TTSVoice[] = [];
   ttsNativeVoices: TTSVoice[] = [];
   ttsTargetLang: string = '';
 
@@ -169,6 +172,7 @@ export class TTSController extends EventTarget {
     super();
     this.ttsWebClient = new WebSpeechClient(this);
     this.ttsEdgeClient = new EdgeTTSClient(this, appService);
+    this.ttsOpenAIClient = new OpenAITTSClient(this, appService);
     // Native TTS is backed by Android TextToSpeech and iOS AVSpeechSynthesizer.
     // TODO: implement native TTS client for desktop platforms.
     if (appService?.isAndroidApp || appService?.isIOSApp) {
@@ -308,6 +312,11 @@ export class TTSController extends EventTarget {
     if (await this.ttsEdgeClient.init()) {
       availableClients.push(this.ttsEdgeClient);
     }
+    // Only available when an endpoint is configured AND the server answers
+    // the /v1/models health check; otherwise init is a silent no-op.
+    if (await this.ttsOpenAIClient.init()) {
+      availableClients.push(this.ttsOpenAIClient);
+    }
     if (this.ttsNativeClient && (await this.ttsNativeClient.init())) {
       availableClients.push(this.ttsNativeClient);
       this.ttsNativeVoices = await this.ttsNativeClient.getAllVoices();
@@ -327,6 +336,7 @@ export class TTSController extends EventTarget {
     }
     this.ttsWebVoices = await this.ttsWebClient.getAllVoices();
     this.ttsEdgeVoices = await this.ttsEdgeClient.getAllVoices();
+    this.ttsOpenAIVoices = await this.ttsOpenAIClient.getAllVoices();
   }
 
   #getPrimaryContent() {
@@ -466,11 +476,18 @@ export class TTSController extends EventTarget {
     return true;
   }
 
-  // Build (or return) the virtual timeline for the current section. Edge-only:
-  // it is the only client with measurable audio durations and a chunk clock.
+  // Whether the active client plays through the shared Web Audio pipeline
+  // (measurable trimmed durations + a chunk clock), which is what the virtual
+  // section timeline needs. Edge and the OpenAI-compatible client qualify.
+  #clientHasAudioClock(): boolean {
+    return this.ttsClient === this.ttsEdgeClient || this.ttsClient === this.ttsOpenAIClient;
+  }
+
+  // Build (or return) the virtual timeline for the current section. Only for
+  // clients with measurable audio durations and a chunk clock (Edge/OpenAI).
   // Callers invoke this off the playback path (panel poll, media session).
   async ensureTimeline(): Promise<SectionTimeline | null> {
-    if (this.ttsClient !== this.ttsEdgeClient) return null;
+    if (!this.#clientHasAudioClock()) return null;
     if (this.#sectionTimeline && this.#timelineSectionIndex === this.#ttsSectionIndex) {
       return this.#sectionTimeline;
     }
@@ -498,18 +515,18 @@ export class TTSController extends EventTarget {
     return timeline;
   }
 
-  // Whether the active client can ever produce a timeline (Edge only). The
-  // scrubber renders a reserved disabled slot while true and info is still
-  // null, and hides entirely while false.
+  // Whether the active client can ever produce a timeline. The scrubber
+  // renders a reserved disabled slot while true and info is still null, and
+  // hides entirely while false.
   supportsPlaybackInfo(): boolean {
-    return this.ttsClient === this.ttsEdgeClient;
+    return this.#clientHasAudioClock();
   }
 
   // Position/duration of the current section playback at the current rate.
   // Null while no timeline exists (non-Edge client, timeline not yet built,
   // or nothing located yet) — the UI reserves a disabled slot for that state.
   getPlaybackInfo(): { position: number; duration: number; measuredFraction: number } | null {
-    if (this.ttsClient !== this.ttsEdgeClient) return null;
+    if (!this.#clientHasAudioClock()) return null;
     const timeline = this.#sectionTimeline;
     if (!timeline || this.#timelineSectionIndex !== this.#ttsSectionIndex) return null;
     const duration = timeline.getDuration();
@@ -864,6 +881,7 @@ export class TTSController extends EventTarget {
 
   async setPrimaryLang(lang: string) {
     if (this.ttsEdgeClient.initialized) this.ttsEdgeClient.setPrimaryLang(lang);
+    if (this.ttsOpenAIClient.initialized) this.ttsOpenAIClient.setPrimaryLang(lang);
     if (this.ttsWebClient.initialized) this.ttsWebClient.setPrimaryLang(lang);
     if (this.ttsNativeClient?.initialized) this.ttsNativeClient?.setPrimaryLang(lang);
   }
@@ -878,9 +896,17 @@ export class TTSController extends EventTarget {
   async getVoices(lang: string) {
     const ttsWebVoices = await this.ttsWebClient.getVoices(lang);
     const ttsEdgeVoices = await this.ttsEdgeClient.getVoices(lang);
+    const ttsOpenAIVoices = this.ttsOpenAIClient.initialized
+      ? await this.ttsOpenAIClient.getVoices(lang)
+      : [];
     const ttsNativeVoices = (await this.ttsNativeClient?.getVoices(lang)) ?? [];
 
-    const voicesGroups = [...ttsNativeVoices, ...ttsEdgeVoices, ...ttsWebVoices];
+    const voicesGroups = [
+      ...ttsNativeVoices,
+      ...ttsOpenAIVoices,
+      ...ttsEdgeVoices,
+      ...ttsWebVoices,
+    ];
     return voicesGroups;
   }
 
@@ -889,10 +915,16 @@ export class TTSController extends EventTarget {
     const useEdgeTTS = !!this.ttsEdgeVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
     );
+    const useOpenAITTS = !!this.ttsOpenAIVoices.find(
+      (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
+    );
     const useNativeTTS = !!this.ttsNativeVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
     );
-    if (useEdgeTTS) {
+    if (useOpenAITTS && !useEdgeTTS) {
+      this.ttsClient = this.ttsOpenAIClient;
+      await this.ttsClient.setRate(this.ttsRate);
+    } else if (useEdgeTTS) {
       this.ttsClient = this.ttsEdgeClient;
       await this.ttsClient.setRate(this.ttsRate);
     } else if (useNativeTTS) {
@@ -1162,6 +1194,9 @@ export class TTSController extends EventTarget {
     }
     if (this.ttsEdgeClient.initialized) {
       await this.ttsEdgeClient.shutdown();
+    }
+    if (this.ttsOpenAIClient.initialized) {
+      await this.ttsOpenAIClient.shutdown();
     }
     if (this.ttsNativeClient?.initialized) {
       await this.ttsNativeClient.shutdown();

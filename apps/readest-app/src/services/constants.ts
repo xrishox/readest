@@ -239,6 +239,8 @@ export const DEFAULT_READSETTINGS: ReadSettings = {
   translationProvider: 'deepl',
   translateTargetLang: 'EN',
   wordLensAutoDownload: true,
+  openaiTtsEndpoint: '',
+  openaiTtsApiKey: '',
 
   customThemes: [],
   highlightStyle: 'highlight',
