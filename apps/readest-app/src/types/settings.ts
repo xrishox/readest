@@ -69,6 +69,8 @@ export interface ReadSettings {
   openaiTtsEndpoint: string;
   /** Optional API key; sent as `Authorization: Bearer <key>` when non-empty. */
   openaiTtsApiKey: string;
+  /** Model id sent in speech requests (from the server's /v1/models; default 'tts-1'). */
+  openaiTtsModel: string;
   highlightStyle: HighlightStyle;
   highlightStyles: Record<HighlightStyle, HighlightColor>;
 

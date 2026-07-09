@@ -88,6 +88,20 @@ export const normalizeOpenAITTSEndpoint = (endpoint: string): string => {
   return base;
 };
 
+// Extract model ids from an OpenAI-style GET /v1/models response
+// ({ object: 'list', data: [{ id, ... }, ...] }).
+export const parseOpenAITTSModelIds = (data: unknown): string[] => {
+  const list = (data as { data?: unknown } | null)?.data;
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((entry) =>
+      entry && typeof (entry as { id?: unknown }).id === 'string'
+        ? (entry as { id: string }).id
+        : null,
+    )
+    .filter((id): id is string => !!id);
+};
+
 const hashPayload = (payload: OpenAITTSPayload): string => md5(JSON.stringify(payload));
 
 export class OpenAISpeechTTS {
@@ -163,6 +177,23 @@ export class OpenAISpeechTTS {
       return response.ok;
     } catch {
       return false;
+    }
+  }
+
+  // Model ids from GET /v1/models; empty on any failure (callers fall back
+  // to the standard OpenAI TTS model names).
+  async fetchModels(): Promise<string[]> {
+    try {
+      const response = await this.#fetchWithTimeout(
+        `${this.#baseUrl}/v1/models`,
+        { method: 'GET', headers: this.#headers() },
+        VOICES_TIMEOUT_MS,
+      );
+      if (!response.ok) return [];
+      return parseOpenAITTSModelIds(await response.json());
+    } catch (err) {
+      console.warn('OpenAI TTS: failed to fetch models', err);
+      return [];
     }
   }
 

@@ -81,6 +81,7 @@ export class OpenAITTSClient implements TTSClient {
   #rate = 1.0;
 
   #openaiTTS: OpenAISpeechTTS | null = null;
+  #model = DEFAULT_MODEL;
   #player = new WebAudioPlayer();
   #activeGeneration: number | null = null;
   #activeQueue: AsyncQueue<SpeakQueueEvent> | null = null;
@@ -102,6 +103,7 @@ export class OpenAITTSClient implements TTSClient {
       return false;
     }
     this.#openaiTTS = new OpenAISpeechTTS(endpoint, readSettings?.openaiTtsApiKey || '');
+    this.#model = readSettings?.openaiTtsModel?.trim() || DEFAULT_MODEL;
     if (await this.#openaiTTS.checkAvailability()) {
       const voices = await this.#openaiTTS.fetchVoices();
       this.#voices = voices.map((voice) => ({
@@ -121,7 +123,7 @@ export class OpenAITTSClient implements TTSClient {
     // Speed stays 1.0 so the audio cache is rate-independent; the playback
     // rate is applied client-side via time-stretch.
     return {
-      model: DEFAULT_MODEL,
+      model: this.#model,
       text,
       voice: voiceId,
       responseFormat: RESPONSE_FORMAT,
