@@ -4,6 +4,7 @@ import {
   inferVoiceFromId,
   normalizeOpenAITTSEndpoint,
   parseOpenAITTSModelIds,
+  parseOpenAITTSVoicesAll,
 } from '@/libs/openaiTTS';
 
 describe('normalizeOpenAITTSEndpoint', () => {
@@ -117,5 +118,70 @@ describe('parseOpenAITTSModelIds', () => {
     expect(parseOpenAITTSModelIds(null)).toEqual([]);
     expect(parseOpenAITTSModelIds({})).toEqual([]);
     expect(parseOpenAITTSModelIds({ data: 'x' })).toEqual([]);
+  });
+});
+
+describe('parseOpenAITTSVoicesAll', () => {
+  it('derives quality from Apple-style ids when the server omits it', () => {
+    expect(
+      parseOpenAITTSVoicesAll({
+        voices: [
+          { id: 'com.apple.voice.premium.en-US.Zoe', name: 'Zoe', lang: 'en-US' },
+          { id: 'com.apple.voice.enhanced.ar-001.Majed', name: 'Majed', lang: 'ar-001' },
+          { id: 'com.apple.voice.super-compact.ar-001.Maged', name: 'Maged', lang: 'ar-001' },
+          { id: 'com.apple.voice.compact.en-US.Samantha', name: 'Samantha', lang: 'en-US' },
+        ],
+      }).map((v) => v.quality),
+    ).toEqual(['premium', 'enhanced', 'super-compact', 'compact']);
+  });
+
+  it('keeps a meaningful server-provided quality over the id-derived one', () => {
+    expect(
+      parseOpenAITTSVoicesAll({
+        voices: [
+          {
+            id: 'com.apple.voice.compact.en-US.Sam',
+            name: 'Sam',
+            lang: 'en-US',
+            quality: 'premium',
+          },
+        ],
+      })[0]!.quality,
+    ).toBe('premium');
+  });
+
+  it("derives from the id when the server reports a blanket 'default'", () => {
+    // Real-world shape: macos-speech-server sends quality='default' for every
+    // voice, including ones whose Apple id encodes a real tier.
+    expect(
+      parseOpenAITTSVoicesAll({
+        voices: [
+          {
+            id: 'com.apple.voice.premium.en-US.Zoe',
+            name: 'Zoe',
+            lang: 'en-US',
+            quality: 'default',
+          },
+          { id: 'af_heart', name: 'Heart', lang: 'en-US', quality: 'default' },
+        ],
+      }).map((v) => v.quality),
+    ).toEqual(['premium', 'default']);
+  });
+
+  it('leaves quality undefined for ids that encode no tier', () => {
+    expect(
+      parseOpenAITTSVoicesAll({ voices: [{ id: 'af_heart', name: 'Heart', lang: 'en-US' }] })[0]!
+        .quality,
+    ).toBeUndefined();
+  });
+
+  it('filters bare strings and malformed entries so callers fall back to the flat list', () => {
+    expect(
+      parseOpenAITTSVoicesAll({
+        voices: ['com.apple.voice.premium.en-US.Zoe', { id: 'x' }, null, 42],
+      }),
+    ).toEqual([]);
+    expect(parseOpenAITTSVoicesAll(null)).toEqual([]);
+    expect(parseOpenAITTSVoicesAll({})).toEqual([]);
   });
 });
