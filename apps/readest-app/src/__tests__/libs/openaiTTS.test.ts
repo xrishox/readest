@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  compareVoiceQuality,
   inferVoiceFromId,
   normalizeOpenAITTSEndpoint,
   parseOpenAITTSModelIds,
@@ -65,6 +66,31 @@ describe('inferVoiceFromId', () => {
       name: 'some-voice',
       lang: 'en-US',
     });
+  });
+});
+
+describe('compareVoiceQuality', () => {
+  it('orders premium before enhanced before everything else', () => {
+    const voices = [
+      { quality: undefined },
+      { quality: 'default' },
+      { quality: 'premium' },
+      { quality: 'enhanced' },
+      { quality: 'super-compact' },
+    ];
+    const sorted = [...voices].sort(compareVoiceQuality);
+    expect(sorted.map((v) => v.quality)).toEqual([
+      'premium',
+      'enhanced',
+      undefined,
+      'default',
+      'super-compact',
+    ]);
+  });
+
+  it('is stable (returns 0) within the same tier', () => {
+    expect(compareVoiceQuality({ quality: 'default' }, { quality: 'compact' })).toBe(0);
+    expect(compareVoiceQuality({ quality: 'premium' }, { quality: 'premium' })).toBe(0);
   });
 });
 

@@ -88,6 +88,14 @@ export const normalizeOpenAITTSEndpoint = (endpoint: string): string => {
   return base;
 };
 
+// Quality-tier ordering for voice lists: premium first, then enhanced, then
+// everything else (default/compact/unknown share one tier so the comparator
+// stays stable within it and secondary sorts apply).
+const QUALITY_RANK: Record<string, number> = { premium: 0, enhanced: 1 };
+
+export const compareVoiceQuality = (a: { quality?: string }, b: { quality?: string }): number =>
+  (QUALITY_RANK[a.quality ?? ''] ?? 2) - (QUALITY_RANK[b.quality ?? ''] ?? 2);
+
 // Extract model ids from an OpenAI-style GET /v1/models response
 // ({ object: 'list', data: [{ id, ... }, ...] }).
 export const parseOpenAITTSModelIds = (data: unknown): string[] => {

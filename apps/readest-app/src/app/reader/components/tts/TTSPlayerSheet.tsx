@@ -364,6 +364,19 @@ const TTSPlayerSheet = ({
                   >
                     {_(voice.name)}
                   </span>
+                  {voice.quality && (
+                    <span
+                      className={clsx(
+                        'shrink-0 rounded-full border px-1.5 py-px text-[10px] font-medium uppercase tracking-wide',
+                        voice.quality === 'premium'
+                          ? 'border-primary/50 text-primary'
+                          : 'border-base-content/30 text-base-content/70',
+                        voice.disabled && 'opacity-40',
+                      )}
+                    >
+                      {voice.quality === 'premium' ? _('Premium') : _('Enhanced')}
+                    </span>
+                  )}
                 </button>
               ))}
             </div>
