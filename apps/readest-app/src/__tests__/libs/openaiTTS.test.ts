@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { inferVoiceFromId, normalizeOpenAITTSEndpoint } from '@/libs/openaiTTS';
+import {
+  inferVoiceFromId,
+  normalizeOpenAITTSEndpoint,
+  parseOpenAITTSModelIds,
+} from '@/libs/openaiTTS';
 
 describe('normalizeOpenAITTSEndpoint', () => {
   it('strips trailing slashes', () => {
@@ -61,5 +65,31 @@ describe('inferVoiceFromId', () => {
       name: 'some-voice',
       lang: 'en-US',
     });
+  });
+});
+
+describe('parseOpenAITTSModelIds', () => {
+  it('extracts ids from an OpenAI-style model list', () => {
+    expect(
+      parseOpenAITTSModelIds({
+        object: 'list',
+        data: [
+          { id: 'tts-1', object: 'model' },
+          { id: 'tts-1-hd', object: 'model' },
+        ],
+      }),
+    ).toEqual(['tts-1', 'tts-1-hd']);
+  });
+
+  it('ignores malformed entries', () => {
+    expect(
+      parseOpenAITTSModelIds({ data: [{ id: 'tts-1' }, { id: 42 }, 'nope', null, {}] }),
+    ).toEqual(['tts-1']);
+  });
+
+  it('returns empty for non-list payloads', () => {
+    expect(parseOpenAITTSModelIds(null)).toEqual([]);
+    expect(parseOpenAITTSModelIds({})).toEqual([]);
+    expect(parseOpenAITTSModelIds({ data: 'x' })).toEqual([]);
   });
 });

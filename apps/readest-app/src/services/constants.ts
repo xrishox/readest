@@ -241,6 +241,7 @@ export const DEFAULT_READSETTINGS: ReadSettings = {
   wordLensAutoDownload: true,
   openaiTtsEndpoint: '',
   openaiTtsApiKey: '',
+  openaiTtsModel: 'tts-1',
 
   customThemes: [],
   highlightStyle: 'highlight',

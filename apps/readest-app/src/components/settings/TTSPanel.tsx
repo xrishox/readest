@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import { OpenAISpeechTTS } from '@/libs/openaiTTS';
 import { useEnv } from '@/context/EnvContext';
 import { useReaderStore } from '@/store/readerStore';
 import { useSettingsStore } from '@/store/settingsStore';
@@ -38,6 +39,15 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
   const [openaiTtsApiKey, setOpenaiTtsApiKey] = useState(
     settings.globalReadSettings.openaiTtsApiKey || '',
   );
+  const [openaiTtsModel, setOpenaiTtsModel] = useState(
+    settings.globalReadSettings.openaiTtsModel || 'tts-1',
+  );
+  const [openaiTtsModels, setOpenaiTtsModels] = useState<string[]>([]);
+  const [openaiTtsTestStatus, setOpenaiTtsTestStatus] = useState<{
+    state: 'idle' | 'testing' | 'ok' | 'fail';
+    message: string;
+  }>({ state: 'idle', message: '' });
+  const openaiTtsTestSeq = useRef(0);
 
   const resetToDefaults = useResetViewSettings();
 
@@ -107,18 +117,73 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
 
   // Persisted on blur; the OpenAI-compatible client reads these the next time
   // Read Aloud starts (TTSController.init constructs the client from them).
-  const saveOpenaiTtsSettings = (endpoint: string, apiKey: string) => {
+  const saveOpenaiTtsSettings = (endpoint: string, apiKey: string, model = openaiTtsModel) => {
     if (
       endpoint === settings.globalReadSettings.openaiTtsEndpoint &&
-      apiKey === settings.globalReadSettings.openaiTtsApiKey
+      apiKey === settings.globalReadSettings.openaiTtsApiKey &&
+      model === settings.globalReadSettings.openaiTtsModel
     ) {
       return;
     }
     settings.globalReadSettings.openaiTtsEndpoint = endpoint;
     settings.globalReadSettings.openaiTtsApiKey = apiKey;
+    settings.globalReadSettings.openaiTtsModel = model;
     setSettings(settings);
     saveSettings(envConfig, settings);
   };
+
+  const handleOpenaiTtsModelChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    const model = event.target.value;
+    setOpenaiTtsModel(model);
+    saveOpenaiTtsSettings(openaiTtsEndpoint.trim(), openaiTtsApiKey.trim(), model);
+  };
+
+  // Connectivity test: health check, then voice + model counts. The seq guard
+  // drops stale results when the user re-tests with an edited endpoint.
+  const handleOpenaiTtsTest = async () => {
+    const endpoint = openaiTtsEndpoint.trim();
+    saveOpenaiTtsSettings(endpoint, openaiTtsApiKey.trim());
+    if (!endpoint) {
+      setOpenaiTtsTestStatus({ state: 'fail', message: _('Enter an endpoint URL first.') });
+      return;
+    }
+    const seq = ++openaiTtsTestSeq.current;
+    setOpenaiTtsTestStatus({ state: 'testing', message: _('Connecting…') });
+    const tts = new OpenAISpeechTTS(endpoint, openaiTtsApiKey.trim());
+    const available = await tts.checkAvailability();
+    if (seq !== openaiTtsTestSeq.current) return;
+    if (!available) {
+      setOpenaiTtsTestStatus({ state: 'fail', message: _('Server not reachable.') });
+      return;
+    }
+    const [voices, models] = await Promise.all([tts.fetchVoices(), tts.fetchModels()]);
+    if (seq !== openaiTtsTestSeq.current) return;
+    if (models.length > 0) {
+      setOpenaiTtsModels(models);
+      if (!models.includes(openaiTtsModel)) {
+        setOpenaiTtsModel(models[0]!);
+        saveOpenaiTtsSettings(endpoint, openaiTtsApiKey.trim(), models[0]!);
+      }
+    }
+    if (voices.length > 0) {
+      setOpenaiTtsTestStatus({
+        state: 'ok',
+        message: _('Connected — {{count}} voices available', { count: voices.length }),
+      });
+    } else {
+      setOpenaiTtsTestStatus({
+        state: 'fail',
+        message: _('Connected, but the server reported no voices.'),
+      });
+    }
+  };
+
+  // Server-reported models when known (after a Test), else the standard OpenAI
+  // names; the saved model always stays selectable.
+  const baseModels = openaiTtsModels.length > 0 ? openaiTtsModels : ['tts-1', 'tts-1-hd'];
+  const openaiTtsModelOptions = baseModels.includes(openaiTtsModel)
+    ? baseModels
+    : [openaiTtsModel, ...baseModels];
 
   return (
     <div className='my-4 w-full space-y-6'>
@@ -175,6 +240,37 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
             onChange={(e) => setOpenaiTtsApiKey(e.target.value)}
             onBlur={() => saveOpenaiTtsSettings(openaiTtsEndpoint.trim(), openaiTtsApiKey.trim())}
           />
+        </SettingsRow>
+        <SettingsRow label={_('Model')}>
+          <SettingsSelect
+            value={openaiTtsModel}
+            onChange={handleOpenaiTtsModelChange}
+            ariaLabel={_('Model')}
+            options={openaiTtsModelOptions.map((model) => ({ value: model, label: model }))}
+          />
+        </SettingsRow>
+        <SettingsRow
+          label={_('Connection')}
+          description={
+            openaiTtsTestStatus.state === 'idle' ? undefined : (
+              <span
+                className={
+                  openaiTtsTestStatus.state === 'fail' ? 'text-error' : 'text-base-content/75'
+                }
+              >
+                {openaiTtsTestStatus.message}
+              </span>
+            )
+          }
+        >
+          <button
+            type='button'
+            className='btn btn-sm eink-bordered font-normal normal-case'
+            disabled={openaiTtsTestStatus.state === 'testing'}
+            onClick={handleOpenaiTtsTest}
+          >
+            {openaiTtsTestStatus.state === 'testing' ? _('Testing…') : _('Test')}
+          </button>
         </SettingsRow>
       </BoxedList>
       <Tips>
