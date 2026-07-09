@@ -14,6 +14,8 @@ export type TTSVoice = {
   name: string;
   lang: string;
   disabled?: boolean;
+  /** Above-default quality tier, shown as a badge in the voice picker. */
+  quality?: 'premium' | 'enhanced';
 };
 
 export type TTSVoicesGroup = {

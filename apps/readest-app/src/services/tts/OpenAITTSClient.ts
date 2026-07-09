@@ -2,6 +2,7 @@ import { getUserLocale } from '@/utils/misc';
 import { isSameLang } from '@/utils/lang';
 import { TTSClient, TTSMessageEvent } from './TTSClient';
 import {
+  compareVoiceQuality,
   OpenAISpeechTTS,
   OpenAITTSPayload,
   OpenAITTSRequestError,
@@ -59,14 +60,14 @@ class AsyncQueue<T> {
   }
 }
 
-// Voice label shown in the picker: include the quality tier when the server
-// reports a non-default one, plus the locale so region variants of the same
-// primary language stay distinguishable (the list is filtered by primary
-// language only), e.g. 'Zoe (premium) — en-US'.
-const formatVoiceName = (voice: OpenAITTSVoice): string => {
-  const quality = voice.quality && voice.quality !== 'default' ? ` (${voice.quality})` : '';
-  return `${voice.name}${quality} — ${voice.lang}`;
-};
+// Voice label shown in the picker: name plus locale so region variants of the
+// same primary language stay distinguishable (the list is filtered by primary
+// language only), e.g. 'Zoe — en-US'. The quality tier renders as a separate
+// badge (TTSVoice.quality), not as part of the name.
+const formatVoiceName = (voice: OpenAITTSVoice): string => `${voice.name} — ${voice.lang}`;
+
+const voiceQualityTier = (quality?: string): TTSVoice['quality'] =>
+  quality === 'premium' || quality === 'enhanced' ? quality : undefined;
 
 export class OpenAITTSClient implements TTSClient {
   name = 'openai-tts';
@@ -110,6 +111,7 @@ export class OpenAITTSClient implements TTSClient {
         id: voice.id,
         name: formatVoiceName(voice),
         lang: voice.lang,
+        quality: voiceQualityTier(voice.quality),
       }));
       this.initialized = this.#voices.length > 0;
     } else {
@@ -467,7 +469,11 @@ export class OpenAITTSClient implements TTSClient {
     const voicesGroup: TTSVoicesGroup = {
       id: 'openai-tts',
       name: 'OpenAI-Compatible TTS',
-      voices: filteredVoices.sort(TTSUtils.sortVoicesPreferLocaleFunc(locale)),
+      // Premium first, then enhanced, then the rest; locale preference breaks
+      // ties within each tier.
+      voices: filteredVoices.sort(
+        (a, b) => compareVoiceQuality(a, b) || TTSUtils.sortVoicesPreferLocaleFunc(locale)(a, b),
+      ),
       disabled: !this.initialized || filteredVoices.length === 0,
     };
 
