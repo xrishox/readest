@@ -180,4 +180,29 @@ describe('OpenAISpeechTTS transport', () => {
     expect(unsupportedAt400.isSkippableInput).toBe(false);
     expect(invalidModel.isSkippableInput).toBe(false);
   });
+
+  it('connection verification synthesizes and decodes through the codec fallback ladder', async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { response_format: string };
+      if (body.response_format === 'opus') {
+        return audioResponse([1], 'audio/ogg; codecs=opus');
+      }
+      return audioResponse([2], 'audio/mp4; codecs=mp4a.40.2');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const decode = vi.fn(async (data: ArrayBuffer) => {
+      if (new Uint8Array(data)[0] === 1) throw new Error('Opus unavailable');
+    });
+    const client = new OpenAISpeechTTS('https://verification.example');
+
+    await expect(client.verifySynthesis('tts-1', 'voice-1', decode)).resolves.toBe('aac');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(decode).toHaveBeenCalledTimes(2);
+    expect(
+      fetchMock.mock.calls.map(
+        (call) =>
+          (JSON.parse(String(call[1]?.body)) as { response_format: string }).response_format,
+      ),
+    ).toEqual(['opus', 'aac']);
+  });
 });

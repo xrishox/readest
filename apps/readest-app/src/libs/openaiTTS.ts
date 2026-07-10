@@ -469,4 +469,42 @@ export class OpenAISpeechTTS {
     if (signal?.aborted) throw abortError(signal);
     return { data, contentType: blob.type };
   }
+
+  // A settings-screen connection check is only successful after the endpoint
+  // has synthesized real audio and this runtime has decoded it. Try the same
+  // compatibility ladder as playback, but never disguise auth/network/server
+  // errors as codec incompatibility.
+  async verifySynthesis(
+    model: string,
+    voice: string,
+    decode: (data: ArrayBuffer) => Promise<unknown>,
+    signal?: AbortSignal,
+  ): Promise<OpenAITTSResponseFormat> {
+    const formats: readonly OpenAITTSResponseFormat[] = ['opus', 'aac', 'wav'];
+    for (const responseFormat of formats) {
+      const payload: OpenAITTSPayload = {
+        model,
+        voice,
+        responseFormat,
+        speed: 1,
+        text: 'Readest Siri voice connection test.',
+      };
+      let audio: OpenAITTSAudioData;
+      try {
+        audio = await this.createAudioData(payload, signal);
+      } catch (error) {
+        if (error instanceof OpenAITTSRequestError && error.isUnsupportedFormat) continue;
+        throw error;
+      }
+      try {
+        await decode(audio.data.slice(0));
+        return responseFormat;
+      } catch (error) {
+        this.evictAudio(payload);
+        if (signal?.aborted) throw abortError(signal);
+        if (responseFormat === formats.at(-1)) throw error;
+      }
+    }
+    throw new Error('No supported OpenAI TTS audio format was available.');
+  }
 }

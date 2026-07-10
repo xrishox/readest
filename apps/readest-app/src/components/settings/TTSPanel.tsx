@@ -138,8 +138,8 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
     saveOpenaiTtsSettings(openaiTtsEndpoint.trim(), openaiTtsApiKey.trim(), model);
   };
 
-  // Connectivity test: health check, then voice + model counts. The seq guard
-  // drops stale results when the user re-tests with an edited endpoint.
+  // Connectivity test: health, voice/model discovery, real synthesis, and
+  // runtime decode. The seq guard drops stale results after endpoint edits.
   const handleOpenaiTtsTest = async () => {
     const endpoint = openaiTtsEndpoint.trim();
     saveOpenaiTtsSettings(endpoint, openaiTtsApiKey.trim());
@@ -156,24 +156,47 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
       setOpenaiTtsTestStatus({ state: 'fail', message: _('Server not reachable.') });
       return;
     }
-    const [voices, models] = await Promise.all([tts.fetchVoices(), tts.fetchModels()]);
-    if (seq !== openaiTtsTestSeq.current) return;
-    if (models.length > 0) {
-      setOpenaiTtsModels(models);
-      if (!models.includes(openaiTtsModel)) {
-        setOpenaiTtsModel(models[0]!);
-        saveOpenaiTtsSettings(endpoint, openaiTtsApiKey.trim(), models[0]!);
+    try {
+      const [voices, models] = await Promise.all([tts.fetchVoices(), tts.fetchModels()]);
+      if (seq !== openaiTtsTestSeq.current) return;
+      if (voices.length === 0) {
+        setOpenaiTtsTestStatus({
+          state: 'fail',
+          message: _('Connected, but the server reported no voices.'),
+        });
+        return;
       }
-    }
-    if (voices.length > 0) {
+      const model = models.includes(openaiTtsModel) ? openaiTtsModel : models[0] || openaiTtsModel;
+      if (models.length > 0) {
+        setOpenaiTtsModels(models);
+        if (model !== openaiTtsModel) {
+          setOpenaiTtsModel(model);
+          saveOpenaiTtsSettings(endpoint, openaiTtsApiKey.trim(), model);
+        }
+      }
+      const context = new AudioContext();
+      let format: string;
+      try {
+        format = await tts.verifySynthesis(model, voices[0]!.id, (data) =>
+          context.decodeAudioData(data.slice(0)),
+        );
+      } finally {
+        await context.close();
+      }
+      if (seq !== openaiTtsTestSeq.current) return;
       setOpenaiTtsTestStatus({
         state: 'ok',
-        message: _('Connected — {{count}} voices available', { count: voices.length }),
+        message: _('Connected — {{count}} voices; {{format}} synthesis decoded', {
+          count: voices.length,
+          format: format.toUpperCase(),
+        }),
       });
-    } else {
+    } catch (error) {
+      console.warn('OpenAI TTS connection test failed', error);
+      if (seq !== openaiTtsTestSeq.current) return;
       setOpenaiTtsTestStatus({
         state: 'fail',
-        message: _('Connected, but the server reported no voices.'),
+        message: _('Server connected, but synthesis or audio decoding failed.'),
       });
     }
   };
