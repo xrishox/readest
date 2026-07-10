@@ -3,6 +3,7 @@ import type { OpenAITTSPayload, OpenAITTSResponseFormat } from '@/libs/openaiTTS
 import {
   decodeOpenAITTSAudioWithFallback,
   getOpenAITTSProbeData,
+  OPENAI_TTS_FORMAT_ORDER,
   OpenAITTSCodecNegotiator,
 } from '@/services/tts/openaiTTSCodec';
 
@@ -12,7 +13,6 @@ const identifyContainer = (data: ArrayBuffer): OpenAITTSResponseFormat => {
     String.fromCharCode(...bytes.subarray(start, start + length));
   if (ascii(0, 4) === 'OggS') return 'opus';
   if (ascii(4, 4) === 'ftyp') return 'aac';
-  if (ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WAVE') return 'wav';
   throw new DOMException('Invalid fixture', 'EncodingError');
 };
 
@@ -38,13 +38,12 @@ const payload = (format: OpenAITTSResponseFormat): OpenAITTSPayload => ({
 });
 
 describe('OpenAI TTS codec negotiation', () => {
-  it('embeds valid signatures for Ogg Opus, AAC/M4A, and WAV probes', () => {
+  it('negotiates only compressed Ogg Opus and AAC/M4A streams', () => {
+    expect(OPENAI_TTS_FORMAT_ORDER).toEqual(['opus', 'aac']);
     expect(identifyContainer(getOpenAITTSProbeData('opus'))).toBe('opus');
     expect(identifyContainer(getOpenAITTSProbeData('aac'))).toBe('aac');
-    expect(identifyContainer(getOpenAITTSProbeData('wav'))).toBe('wav');
     expect(getOpenAITTSProbeData('opus').byteLength).toBe(312);
     expect(getOpenAITTSProbeData('aac').byteLength).toBe(4692);
-    expect(getOpenAITTSProbeData('wav').byteLength).toBe(364);
   });
 
   it('defaults to Opus and pins it after a real stream succeeds', async () => {
@@ -67,12 +66,12 @@ describe('OpenAI TTS codec negotiation', () => {
     expect(negotiator.minimumFormat).toBe('aac');
   });
 
-  it('uses WAV when the same AudioContext rejects both compressed containers', async () => {
+  it('fails clearly when the same AudioContext rejects both compressed containers', async () => {
     const context = new FakeAudioContext(new Set(['opus', 'aac']));
     const negotiator = new OpenAITTSCodecNegotiator((data) => context.decodeAudioData(data));
 
-    expect(await negotiator.nextFormat()).toBe('wav');
-    expect(context.attempted).toEqual(['opus', 'aac', 'wav']);
+    await expect(negotiator.nextFormat()).rejects.toThrow(/Opus or AAC/);
+    expect(context.attempted).toEqual(['opus', 'aac']);
   });
 
   it('falls through when decodeAudioData hangs on a container', async () => {

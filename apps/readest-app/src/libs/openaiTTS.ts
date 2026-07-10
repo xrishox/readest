@@ -1,14 +1,17 @@
 import { md5 } from 'js-md5';
-import { LRUCache } from '@/utils/lru';
 import { isTauriAppPlatform } from '@/services/environment';
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
+import {
+  OpenAITTSAudioMemoryCache,
+  type OpenAITTSCachedAudio,
+} from '@/services/tts/openaiTTSAudioCache';
 
 // Client for a self-hosted OpenAI-compatible TTS server (e.g. a patched
 // macos-speech-server, openedai-speech, kokoro-fastapi). Wire contract:
 //   GET  {base}/v1/models           -> OpenAI-style model list (health check)
 //   GET  {base}/v1/audio/voices     -> { voices: ["<id>", ...] }
 //   GET  {base}/v1/audio/voices/all -> { voices: [{ id, name, lang, quality }] }
-//   POST {base}/v1/audio/speech     -> audio bytes (Opus/AAC/WAV requested)
+//   POST {base}/v1/audio/speech     -> audio bytes (Opus/AAC requested)
 // Synthesis is always requested at speed 1.0; the playback rate is applied
 // client-side via WSOLA time-stretch (see OpenAITTSClient), which keeps the
 // audio cache rate-independent.
@@ -25,7 +28,8 @@ export interface OpenAITTSPayload {
   speed: number;
 }
 
-export type OpenAITTSResponseFormat = 'opus' | 'aac' | 'wav';
+export const OPENAI_TTS_FORMAT_ORDER = ['opus', 'aac'] as const;
+export type OpenAITTSResponseFormat = (typeof OPENAI_TTS_FORMAT_ORDER)[number];
 
 export interface OpenAITTSAudioData {
   data: ArrayBuffer;
@@ -40,7 +44,7 @@ export interface OpenAITTSVoice {
 }
 
 const FORMAT_ERROR_PATTERN =
-  /(?:unsupported|invalid|unavailable|not (?:supported|available|implemented)).{0,80}(?:response[_ -]?format|audio format|codec|opus|aac|m4a|wav)|(?:response[_ -]?format|audio format|codec|opus|aac|m4a|wav).{0,80}(?:unsupported|invalid|unavailable|not (?:supported|available|implemented))/i;
+  /(?:unsupported|invalid|unavailable|not (?:supported|available|implemented)).{0,80}(?:response[_ -]?format|audio format|codec|opus|aac|m4a)|(?:response[_ -]?format|audio format|codec|opus|aac|m4a).{0,80}(?:unsupported|invalid|unavailable|not (?:supported|available|implemented))/i;
 const SENTENCE_ERROR_PATTERN = /\b(?:input|text|utterance|sentence|voice|language|character)\b/i;
 
 // Structured HTTP failure from /v1/audio/speech. Callers use the status and
@@ -200,7 +204,7 @@ export const getOpenAITTSCacheKey = (
   );
 
 interface InflightSpeechRequest {
-  promise: Promise<Blob>;
+  promise: Promise<OpenAITTSCachedAudio>;
   controller: AbortController;
   consumers: number;
   settled: boolean;
@@ -214,7 +218,7 @@ const abortError = (signal?: AbortSignal): Error => {
 export class OpenAISpeechTTS {
   // Bounded cache keyed by endpoint + auth fingerprint + the full payload
   // (including response_format), shared across instances like EdgeSpeechTTS.
-  private static audioCache = new LRUCache<string, Blob>(200);
+  private static audioCache = new OpenAITTSAudioMemoryCache();
   // A caller owns one subscription, not the underlying shared fetch. Aborting
   // preload therefore cannot poison playback (or vice versa); the HTTP request
   // is aborted only after its final consumer leaves.
@@ -232,7 +236,7 @@ export class OpenAISpeechTTS {
     return this.#baseUrl;
   }
 
-  #cacheKey(payload: OpenAITTSPayload): string {
+  getCacheKey(payload: OpenAITTSPayload): string {
     return getOpenAITTSCacheKey(this.#baseUrl, this.#apiKey, payload);
   }
 
@@ -344,11 +348,15 @@ export class OpenAISpeechTTS {
     }
   }
 
-  async #fetchSpeech(payload: OpenAITTSPayload, signal?: AbortSignal): Promise<Blob> {
+  async #fetchSpeech(
+    payload: OpenAITTSPayload,
+    signal?: AbortSignal,
+  ): Promise<OpenAITTSCachedAudio> {
     const response = await this.#fetchWithTimeout(
       `${this.#baseUrl}/v1/audio/speech`,
       {
         method: 'POST',
+        cache: 'no-store',
         headers: {
           ...this.#headers(false),
           'Content-Type': 'application/json',
@@ -374,25 +382,25 @@ export class OpenAISpeechTTS {
         responseFormat: payload.responseFormat,
       });
     }
-    const arrayBuffer = await response.arrayBuffer();
+    const bytes = new Uint8Array(await response.arrayBuffer());
     // Keep the server's actual media type. In particular, AAC-LC is carried
     // in M4A and should remain audio/mp4 rather than the fabricated audio/aac.
     const contentType = response.headers.get('content-type')?.trim() || 'application/octet-stream';
-    return new Blob([arrayBuffer], { type: contentType });
+    return { bytes, contentType };
   }
 
   #newInflight(payload: OpenAITTSPayload, cacheKey: string): InflightSpeechRequest {
     const controller = new AbortController();
     const entry: InflightSpeechRequest = {
-      promise: Promise.resolve(new Blob()),
+      promise: Promise.resolve({ bytes: new Uint8Array(), contentType: '' }),
       controller,
       consumers: 0,
       settled: false,
     };
     entry.promise = this.#fetchSpeech(payload, controller.signal)
-      .then((blob) => {
-        if (!controller.signal.aborted) OpenAISpeechTTS.audioCache.set(cacheKey, blob);
-        return blob;
+      .then((audio) => {
+        if (!controller.signal.aborted) OpenAISpeechTTS.audioCache.set(cacheKey, audio);
+        return audio;
       })
       .finally(() => {
         entry.settled = true;
@@ -411,13 +419,13 @@ export class OpenAISpeechTTS {
     cacheKey: string,
     entry: InflightSpeechRequest,
     signal?: AbortSignal,
-  ): Promise<Blob> {
+  ): Promise<OpenAITTSCachedAudio> {
     entry.consumers++;
     let onAbort: (() => void) | undefined;
     try {
       if (!signal) return await entry.promise;
       if (signal.aborted) throw abortError(signal);
-      return await new Promise<Blob>((resolve, reject) => {
+      return await new Promise<OpenAITTSCachedAudio>((resolve, reject) => {
         let done = false;
         const finish = (callback: () => void) => {
           if (done) return;
@@ -428,7 +436,7 @@ export class OpenAISpeechTTS {
         onAbort = () => finish(() => reject(abortError(signal)));
         signal.addEventListener('abort', onAbort, { once: true });
         entry.promise.then(
-          (blob) => finish(() => resolve(blob)),
+          (audio) => finish(() => resolve(audio)),
           (error) => finish(() => reject(error)),
         );
       });
@@ -444,9 +452,12 @@ export class OpenAISpeechTTS {
     }
   }
 
-  async #fetchAndCache(payload: OpenAITTSPayload, signal?: AbortSignal): Promise<Blob> {
+  async #fetchAndCache(
+    payload: OpenAITTSPayload,
+    signal?: AbortSignal,
+  ): Promise<OpenAITTSCachedAudio> {
     if (signal?.aborted) throw abortError(signal);
-    const cacheKey = this.#cacheKey(payload);
+    const cacheKey = this.getCacheKey(payload);
     const cached = OpenAISpeechTTS.audioCache.get(cacheKey);
     if (cached) return cached;
     const pending = OpenAISpeechTTS.inflight.get(cacheKey) ?? this.#newInflight(payload, cacheKey);
@@ -454,7 +465,11 @@ export class OpenAISpeechTTS {
   }
 
   evictAudio(payload: OpenAITTSPayload): boolean {
-    return OpenAISpeechTTS.audioCache.delete(this.#cacheKey(payload));
+    return OpenAISpeechTTS.audioCache.delete(this.getCacheKey(payload));
+  }
+
+  async preloadAudio(payload: OpenAITTSPayload, signal?: AbortSignal): Promise<void> {
+    await this.#fetchAndCache(payload, signal);
   }
 
   // Audio bytes plus the real server media type. Mint a fresh ArrayBuffer copy
@@ -464,10 +479,10 @@ export class OpenAISpeechTTS {
     payload: OpenAITTSPayload,
     signal?: AbortSignal,
   ): Promise<OpenAITTSAudioData> {
-    const blob = await this.#fetchAndCache(payload, signal);
-    const data = await blob.arrayBuffer();
+    const audio = await this.#fetchAndCache(payload, signal);
+    const data = audio.bytes.slice().buffer;
     if (signal?.aborted) throw abortError(signal);
-    return { data, contentType: blob.type };
+    return { data, contentType: audio.contentType };
   }
 
   // A settings-screen connection check is only successful after the endpoint
@@ -480,8 +495,7 @@ export class OpenAISpeechTTS {
     decode: (data: ArrayBuffer) => Promise<unknown>,
     signal?: AbortSignal,
   ): Promise<OpenAITTSResponseFormat> {
-    const formats: readonly OpenAITTSResponseFormat[] = ['opus', 'aac', 'wav'];
-    for (const responseFormat of formats) {
+    for (const responseFormat of OPENAI_TTS_FORMAT_ORDER) {
       const payload: OpenAITTSPayload = {
         model,
         voice,
@@ -502,7 +516,7 @@ export class OpenAISpeechTTS {
       } catch (error) {
         this.evictAudio(payload);
         if (signal?.aborted) throw abortError(signal);
-        if (responseFormat === formats.at(-1)) throw error;
+        if (responseFormat === OPENAI_TTS_FORMAT_ORDER.at(-1)) throw error;
       }
     }
     throw new Error('No supported OpenAI TTS audio format was available.');

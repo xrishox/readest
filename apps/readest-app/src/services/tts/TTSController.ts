@@ -18,6 +18,7 @@ import { SectionTimeline, TimelineSentence } from './SectionTimeline';
 import { TTSUtils } from './TTSUtils';
 import { TTSClient } from './TTSClient';
 import { isValidLang } from '@/utils/lang';
+import { collectOpenAITTSLookahead, type OpenAITTSLookaheadCandidate } from './openaiTTSLookahead';
 import {
   computeWordOffsets,
   getTextSubRange,
@@ -152,7 +153,7 @@ export class TTSController extends EventTarget {
   ttsClient: TTSClient;
   ttsWebClient: TTSClient;
   ttsEdgeClient: TTSClient;
-  ttsOpenAIClient: TTSClient;
+  ttsOpenAIClient: OpenAITTSClient;
   ttsNativeClient: TTSClient | null = null;
   ttsWebVoices: TTSVoice[] = [];
   ttsEdgeVoices: TTSVoice[] = [];
@@ -619,6 +620,7 @@ export class TTSController extends EventTarget {
   }
 
   async preloadNextSSML(count: number = 4) {
+    if (this.ttsClient === this.ttsOpenAIClient) return;
     const tts = this.#getTts();
     if (!tts) return;
 
@@ -646,6 +648,36 @@ export class TTSController extends EventTarget {
     await Promise.all(ssmls.map((ssml) => this.preloadSSML(ssml, new AbortController().signal)));
   }
 
+  // OpenAI-only detached lookahead. It reads the live cursor but never moves
+  // it; all future-section documents are discarded after their marks are
+  // extracted by the helper.
+  async getOpenAITTSLookahead(signal: AbortSignal): Promise<OpenAITTSLookaheadCandidate[]> {
+    const currentRange = this.#getTts()?.getLastRange();
+    const currentDocument = this.#ttsDoc;
+    const sections = this.view.book.sections;
+    if (
+      this.ttsClient !== this.ttsOpenAIClient ||
+      !currentRange ||
+      !currentDocument ||
+      !sections ||
+      this.#ttsSectionIndex < 0
+    ) {
+      return [];
+    }
+    return collectOpenAITTSLookahead({
+      currentDocument,
+      currentRange,
+      currentSectionIndex: this.#ttsSectionIndex,
+      sections,
+      granularity: this.#ttsGranularity,
+      nodeFilter: createTTSNodeFilter(),
+      preprocess: (ssml) => this.#preprocessSSML(ssml),
+      voiceId: this.ttsOpenAIClient.getVoiceId(),
+      playbackRate: this.ttsRate,
+      signal,
+    });
+  }
+
   async #preprocessSSML(ssml?: string) {
     if (!ssml) return;
     ssml = ssml
@@ -669,7 +701,7 @@ export class TTSController extends EventTarget {
   }
 
   async #speak(ssml: string | undefined | Promise<string>, oneTime = false) {
-    await this.stop();
+    await this.stop(true);
     this.#terminated = false;
     this.#currentSpeakAbortController = new AbortController();
     const { signal } = this.#currentSpeakAbortController;
@@ -690,7 +722,7 @@ export class TTSController extends EventTarget {
           if (this.#nossmlCnt < 10 && this.state === 'playing' && !oneTime) {
             resolve();
             if (await this.#initTTSForNextSection()) {
-              await this.forward();
+              await this.forward(false, true);
             } else {
               // End of book: nothing left to speak.
               this.#terminate('ended');
@@ -707,7 +739,7 @@ export class TTSController extends EventTarget {
         if (!oneTime) {
           if (!plainText || marks.length === 0) {
             resolve();
-            return await this.forward();
+            return await this.forward(false, true);
           } else {
             this.dispatchSpeakMark(marks[0]);
           }
@@ -729,7 +761,7 @@ export class TTSController extends EventTarget {
         if (lastCode === 'end' && this.state === 'playing' && !oneTime) {
           this.#consecutiveSpeakErrors = 0;
           resolve();
-          await this.forward();
+          await this.forward(false, true);
         } else if (
           lastCode === 'error' &&
           canSkipOnError &&
@@ -749,7 +781,7 @@ export class TTSController extends EventTarget {
           this.#consecutiveSpeakErrors++;
           resolve();
           if (this.#consecutiveSpeakErrors <= TTS_NATIVE_SPEAK_MAX_CONSECUTIVE_ERRORS) {
-            await this.forward();
+            await this.forward(false, true);
           } else {
             this.#consecutiveSpeakErrors = 0;
             this.#terminate('error');
@@ -825,7 +857,10 @@ export class TTSController extends EventTarget {
     await this.ttsClient.resume().catch((e) => this.error(e));
   }
 
-  async stop() {
+  async stop(preserveOpenAIBuffer = false) {
+    if (!preserveOpenAIBuffer && this.ttsClient === this.ttsOpenAIClient) {
+      this.ttsOpenAIClient.stopResilienceBuffer();
+    }
     if (this.#currentSpeakAbortController) {
       this.#currentSpeakAbortController.abort();
     }
@@ -859,10 +894,10 @@ export class TTSController extends EventTarget {
   }
 
   // goto next mark/paragraph
-  async forward(byMark = false) {
+  async forward(byMark = false, preserveOpenAIBuffer = false) {
     await this.initViewTTS();
     const isPlaying = this.state === 'playing';
-    await this.stop();
+    await this.stop(preserveOpenAIBuffer);
     if (!isPlaying) this.state = 'forward-paused';
 
     const ssml = byMark ? this.#getTts()?.nextMark(!isPlaying) : this.#getTts()?.next(!isPlaying);
@@ -912,6 +947,9 @@ export class TTSController extends EventTarget {
 
   async setVoice(voiceId: string, lang: string) {
     this.state = 'setvoice-paused';
+    if (this.ttsClient === this.ttsOpenAIClient) {
+      this.ttsOpenAIClient.invalidateResilienceBuffer();
+    }
     const useEdgeTTS = !!this.ttsEdgeVoices.find(
       (voice) => (voiceId === '' || voice.id === voiceId) && !voice.disabled,
     );
@@ -954,6 +992,7 @@ export class TTSController extends EventTarget {
   }
 
   setTargetLang(lang: string) {
+    if (lang !== this.ttsTargetLang) this.ttsOpenAIClient.invalidateResilienceBuffer();
     this.ttsTargetLang = lang;
   }
 

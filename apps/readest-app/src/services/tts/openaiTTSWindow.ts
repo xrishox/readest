@@ -8,8 +8,8 @@ const abortError = (signal?: AbortSignal): Error => {
 };
 
 // A client-wide priority limiter keeps current playback plus all speculative
-// preloads at ten active jobs. Lookahead jobs use playback priority; Readest's
-// existing next-paragraph preload calls can only fill capacity left over.
+// preloads at ten active jobs. The audible paragraph uses playback priority;
+// the rolling resilience buffer can only fill capacity left over.
 export class OpenAITTSTaskPool {
   readonly #limit: number;
   readonly #playbackQueue: Array<() => void> = [];

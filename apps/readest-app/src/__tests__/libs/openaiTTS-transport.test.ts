@@ -65,20 +65,33 @@ describe('OpenAISpeechTTS transport', () => {
     expect(getOpenAITTSCacheKey('https://cache-a.example', 'secret-b', request)).not.toBe(key);
   });
 
-  it('evicts the least-recently-used audio when the 200-entry cache is full', async () => {
+  it('evicts the least-recently-used audio when the 64-entry cache is full', async () => {
     const fetchMock = vi.fn(async () => audioResponse([1]));
     vi.stubGlobal('fetch', fetchMock);
     const client = new OpenAISpeechTTS('https://bounded-cache.example', 'key');
 
-    for (let index = 0; index <= 200; index++) {
+    for (let index = 0; index <= 64; index++) {
       await client.createAudioData(payload(`bounded-${index}`));
     }
-    expect(fetchMock).toHaveBeenCalledTimes(201);
+    expect(fetchMock).toHaveBeenCalledTimes(65);
 
-    await client.createAudioData(payload('bounded-200'));
-    expect(fetchMock).toHaveBeenCalledTimes(201);
+    await client.createAudioData(payload('bounded-64'));
+    expect(fetchMock).toHaveBeenCalledTimes(65);
     await client.createAudioData(payload('bounded-0'));
-    expect(fetchMock).toHaveBeenCalledTimes(202);
+    expect(fetchMock).toHaveBeenCalledTimes(66);
+  });
+
+  it('explicitly disables the HTTP cache for synthesized speech', async () => {
+    const fetchMock = vi.fn(async () => audioResponse([1]));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new OpenAISpeechTTS('https://no-store.example', 'key');
+
+    await client.createAudioData(payload('no-store'));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://no-store.example/v1/audio/speech',
+      expect.objectContaining({ cache: 'no-store' }),
+    );
   });
 
   it('lets one shared consumer abort without cancelling the remaining consumer', async () => {

@@ -30,21 +30,24 @@ import {
   OpenAITTSOrderedWindow,
   OpenAITTSTaskPool,
 } from './openaiTTSWindow';
+import { type OpenAITTSBufferCandidate, OpenAITTSResilienceBuffer } from './openaiTTSBuffer';
 
 // OpenAI-compatible TTS client for a self-hosted server (endpoint + optional
 // API key configured in Settings -> TTS). Mirrors EdgeTTSClient's playback
-// pipeline: probe + fetch Ogg Opus/AAC-LC/WAV (cached at speed 1.0) -> decode
+// pipeline: probe + fetch Ogg Opus/AAC-LC (cached at speed 1.0) -> decode
 // -> trim silence -> WSOLA time-stretch to the playback rate -> schedule
 // gaplessly on the shared AudioContext. Fetching runs in an ordered current +
-// nine window; decoding stays behind player backpressure. Marks are dispatched
-// when a chunk becomes AUDIBLE, not when it is fetched. The server reports no
-// word boundaries, so granularity and highlighting stay sentence-level.
+// nine foreground window, while a lower-priority rolling buffer spans later
+// paragraphs and chapters. Decoding stays behind player backpressure. Marks
+// are dispatched when a chunk becomes AUDIBLE, not when it is fetched. The
+// server reports no word boundaries, so highlighting stays sentence-level.
 
 const INTER_SENTENCE_GAP_SEC = 0.15;
 const DEFAULT_MODEL = 'tts-1';
 
 interface ChunkMeta {
   mark: TTSMark;
+  payload: OpenAITTSPayload;
   trimStartSec: number;
   trimmedDurationSec: number;
 }
@@ -131,7 +134,8 @@ export class OpenAITTSClient implements TTSClient {
   #player = new WebAudioPlayer();
   #fetchPool = new OpenAITTSTaskPool();
   #activeFetchController: AbortController | null = null;
-  #preloadControllers = new Set<AbortController>();
+  #resilienceBuffer: OpenAITTSResilienceBuffer<OpenAITTSPayload> | null = null;
+  #bufferPlanController: AbortController | null = null;
   #activeGeneration: number | null = null;
   #activeQueue: AsyncQueue<SpeakQueueEvent> | null = null;
   #chunkMeta: ChunkMeta[] = [];
@@ -151,7 +155,21 @@ export class OpenAITTSClient implements TTSClient {
       this.initialized = false;
       return false;
     }
+    this.#resetResilienceBuffer();
     this.#openaiTTS = new OpenAISpeechTTS(endpoint, readSettings?.openaiTtsApiKey || '');
+    this.#resilienceBuffer = new OpenAITTSResilienceBuffer<OpenAITTSPayload>({
+      load: async (item, signal) => {
+        await this.#fetchPool.run(
+          async () => {
+            if (!this.#openaiTTS) throw new Error('OpenAI TTS client is not initialized.');
+            await this.#openaiTTS.preloadAudio(item.value, signal);
+          },
+          signal,
+          'preload',
+        );
+      },
+      evict: (item) => this.#openaiTTS?.evictAudio(item.value),
+    });
     this.#codec = new OpenAITTSCodecNegotiator((data) => this.#player.decode(data));
     this.#model = readSettings?.openaiTtsModel?.trim() || DEFAULT_MODEL;
     if (await this.#openaiTTS.checkAvailability()) {
@@ -311,6 +329,7 @@ export class OpenAITTSClient implements TTSClient {
           const meta = chunkMeta[event.index];
           if (!meta) continue;
           this.controller?.dispatchSpeakMark(meta.mark);
+          this.#onChunkAudible(meta);
           yield {
             code: 'boundary',
             message: `Start chunk: ${meta.mark.name}`,
@@ -350,25 +369,11 @@ export class OpenAITTSClient implements TTSClient {
   }
 
   async *#preload(marks: TTSMark[], signal: AbortSignal) {
-    // Do not create/resume an AudioContext merely for speculative preload: on
-    // Apple platforms the initial codec probe must run in the playback context
-    // warmed by the user gesture. Once playback has pinned a codec, warm only
-    // the nearest mark and await it—never launch detached, uncancellable work.
-    const mark = marks[0];
-    if (mark && this.#codec?.pinnedFormat && !signal.aborted) {
-      const controller = new AbortController();
-      const relayAbort = () => controller.abort(signal.reason);
-      signal.addEventListener('abort', relayAbort, { once: true });
-      this.#preloadControllers.add(controller);
-      try {
-        await this.#fetchMark(mark, controller.signal, 'preload');
-      } catch (err) {
-        if (!controller.signal.aborted) console.warn('Error preloading nearest mark', err);
-      } finally {
-        signal.removeEventListener('abort', relayAbort);
-        this.#preloadControllers.delete(controller);
-      }
-    }
+    // The rolling resilience buffer supersedes Readest's shallow paragraph
+    // preload. Keep this generator contract intact for TTSController without
+    // admitting a competing speculative request.
+    void marks;
+    void signal;
 
     yield {
       code: 'end',
@@ -474,6 +479,7 @@ export class OpenAITTSClient implements TTSClient {
 
         chunkMeta.push({
           mark,
+          payload: decoded.fetched.payload,
           trimStartSec: prepared.trimStartSec,
           trimmedDurationSec: prepared.trimmedDurationSec,
         });
@@ -540,10 +546,6 @@ export class OpenAITTSClient implements TTSClient {
     this.#isPlaying = false;
     this.#activeFetchController?.abort(new DOMException('Speech session stopped', 'AbortError'));
     this.#activeFetchController = null;
-    for (const controller of this.#preloadControllers) {
-      controller.abort(new DOMException('Preload generation stopped', 'AbortError'));
-    }
-    this.#preloadControllers.clear();
     if (this.#activeGeneration !== null) {
       this.#activeGeneration = null;
       // Unblock a generator awaiting the queue; without this a stop() outside
@@ -580,6 +582,7 @@ export class OpenAITTSClient implements TTSClient {
   async setVoice(voice: string) {
     const selectedVoice = this.#voices.find((v) => v.id === voice);
     if (selectedVoice) {
+      this.#resetResilienceBuffer();
       this.#currentVoiceId = selectedVoice.id;
     }
   }
@@ -614,6 +617,7 @@ export class OpenAITTSClient implements TTSClient {
   }
 
   setPrimaryLang(lang: string) {
+    if (lang !== this.#primaryLang) this.#resetResilienceBuffer();
     this.#primaryLang = lang;
   }
 
@@ -635,8 +639,70 @@ export class OpenAITTSClient implements TTSClient {
 
   async shutdown(): Promise<void> {
     await this.stopInternal();
+    this.#resetResilienceBuffer();
+    this.#resilienceBuffer = null;
     await this.#player.shutdown();
     this.initialized = false;
     this.#voices = [];
+  }
+
+  stopResilienceBuffer(): void {
+    this.#bufferPlanController?.abort(new DOMException('OpenAI TTS buffer stopped', 'AbortError'));
+    this.#bufferPlanController = null;
+    this.#resilienceBuffer?.stop();
+  }
+
+  invalidateResilienceBuffer(): void {
+    this.#resetResilienceBuffer();
+  }
+
+  #resetResilienceBuffer() {
+    this.#bufferPlanController?.abort(
+      new DOMException('OpenAI TTS buffer configuration changed', 'AbortError'),
+    );
+    this.#bufferPlanController = null;
+    this.#resilienceBuffer?.shutdown();
+  }
+
+  #onChunkAudible(meta: ChunkMeta) {
+    const transport = this.#openaiTTS;
+    if (!transport) return;
+    this.#resilienceBuffer?.consume(transport.getCacheKey(meta.payload));
+    void this.#refreshResilienceBuffer();
+  }
+
+  async #refreshResilienceBuffer() {
+    const controller = this.controller;
+    const transport = this.#openaiTTS;
+    const buffer = this.#resilienceBuffer;
+    const format = this.#codec?.pinnedFormat;
+    if (!controller || !transport || !buffer || !format) return;
+
+    this.#bufferPlanController?.abort(
+      new DOMException('OpenAI TTS buffer horizon advanced', 'AbortError'),
+    );
+    const planController = new AbortController();
+    this.#bufferPlanController = planController;
+    try {
+      const lookahead = await controller.getOpenAITTSLookahead(planController.signal);
+      const items: OpenAITTSBufferCandidate<OpenAITTSPayload>[] = [];
+      for (const candidate of lookahead) {
+        if (planController.signal.aborted) return;
+        const voiceId = await this.getVoiceIdFromLang(candidate.mark.language);
+        const payload = this.getPayload(candidate.mark.text, voiceId, format);
+        items.push({
+          key: transport.getCacheKey(payload),
+          value: payload,
+          playbackSeconds: candidate.playbackSeconds,
+        });
+      }
+      if (!planController.signal.aborted) buffer.reconcile(items);
+    } catch (error) {
+      if (!planController.signal.aborted) {
+        console.warn('OpenAI TTS lookahead planning failed', error);
+      }
+    } finally {
+      if (this.#bufferPlanController === planController) this.#bufferPlanController = null;
+    }
   }
 }

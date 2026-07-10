@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { TTSMessageEvent } from '@/services/tts/TTSClient';
 import type { TTSController } from '@/services/tts/TTSController';
+import type { OpenAITTSLookaheadCandidate } from '@/services/tts/openaiTTSLookahead';
 import { FakeAudioBuffer, FakeAudioContext, makeBuffer } from './tts-fake-audio';
 
 let parsedMarks: Array<{ name: string; text: string; language: string }> = [];
@@ -35,13 +36,12 @@ vi.mock('@/store/settingsStore', () => ({
   },
 }));
 
-const identifyProbe = (data: ArrayBuffer): 'opus' | 'aac' | 'wav' | null => {
+const identifyProbe = (data: ArrayBuffer): 'opus' | 'aac' | null => {
   const bytes = new Uint8Array(data);
   const ascii = (start: number, length: number) =>
     String.fromCharCode(...bytes.subarray(start, start + length));
   if (ascii(0, 4) === 'OggS') return 'opus';
   if (ascii(4, 4) === 'ftyp') return 'aac';
-  if (ascii(0, 4) === 'RIFF') return 'wav';
   return null;
 };
 
@@ -62,6 +62,7 @@ type OpenAIClientClass = typeof import('@/services/tts/OpenAITTSClient').OpenAIT
 describe('OpenAITTSClient codec playback integration', () => {
   let OpenAITTSClient: OpenAIClientClass;
   let speechFormats: string[];
+  let speechInputs: string[];
   let speechResponse: (format: string) => Response;
 
   beforeEach(async () => {
@@ -69,6 +70,7 @@ describe('OpenAITTSClient codec playback integration', () => {
     FakeAudioContext.instances = [];
     parsedMarks = [{ name: '0', text: 'One sentence.', language: 'en' }];
     speechFormats = [];
+    speechInputs = [];
     speechResponse = (format) =>
       format === 'opus'
         ? new Response(new Uint8Array([0xee]), {
@@ -95,6 +97,7 @@ describe('OpenAITTSClient codec playback integration', () => {
         if (url.endsWith('/v1/audio/speech')) {
           const body = JSON.parse(String(init?.body)) as { response_format: string };
           speechFormats.push(body.response_format);
+          speechInputs.push((JSON.parse(String(init?.body)) as { input: string }).input);
           return speechResponse(body.response_format);
         }
         throw new Error(`Unexpected request: ${url}`);
@@ -110,11 +113,14 @@ describe('OpenAITTSClient codec playback integration', () => {
     vi.unstubAllGlobals();
   });
 
-  const startClient = async () => {
-    const controller = { dispatchSpeakMark: vi.fn() };
+  const startClient = async (lookahead: OpenAITTSLookaheadCandidate[] = []) => {
+    const controller = {
+      dispatchSpeakMark: vi.fn(),
+      getOpenAITTSLookahead: vi.fn(async () => lookahead),
+    };
     const client = new OpenAITTSClient(controller as unknown as TTSController);
     await expect(client.init()).resolves.toBe(true);
-    return client;
+    return { client, controller };
   };
 
   const collect = (client: InstanceType<OpenAIClientClass>) => {
@@ -128,7 +134,7 @@ describe('OpenAITTSClient codec playback integration', () => {
   };
 
   it('evicts undecodable real Opus, retries the sentence as AAC, then pins AAC', async () => {
-    const client = await startClient();
+    const { client } = await startClient();
     const first = collect(client);
     await vi.waitFor(() => expect(FakeAudioContext.instances[0]?.sources).toHaveLength(1));
     expect(speechFormats).toEqual(['opus', 'aac']);
@@ -156,7 +162,7 @@ describe('OpenAITTSClient codec playback integration', () => {
             status: 200,
             headers: { 'Content-Type': 'audio/mp4' },
           });
-    const client = await startClient();
+    const { client } = await startClient();
     const { done } = collect(client);
 
     await vi.waitFor(() => expect(FakeAudioContext.instances[0]?.sources).toHaveLength(1));
@@ -168,11 +174,33 @@ describe('OpenAITTSClient codec playback integration', () => {
   it('surfaces authentication failure as a session error without downgrading', async () => {
     speechResponse = () =>
       new Response('bad credentials', { status: 401, statusText: 'Unauthorized' });
-    const client = await startClient();
+    const { client } = await startClient();
     const { done } = collect(client);
 
     await expect(done).rejects.toThrow(/401 Unauthorized/);
     expect(speechFormats).toEqual(['opus']);
     expect(FakeAudioContext.instances[0]!.sources).toHaveLength(0);
+  });
+
+  it('fills the rolling phone-side buffer after the first real codec is pinned', async () => {
+    const lookahead = Array.from({ length: 15 }, (_, index) => ({
+      mark: { offset: index, name: String(index), text: `Ahead ${index}.`, language: 'en' },
+      sectionIndex: 0,
+      playbackSeconds: 10,
+    }));
+    const { client, controller } = await startClient(lookahead);
+    const { done } = collect(client);
+
+    await vi.waitFor(() => expect(controller.getOpenAITTSLookahead).toHaveBeenCalled());
+    await vi.waitFor(() =>
+      expect(speechInputs.filter((input) => input.startsWith('Ahead '))).toHaveLength(12),
+    );
+    expect(speechInputs.filter((input) => input.startsWith('Ahead '))).toEqual(
+      lookahead.slice(0, 12).map((item) => item.mark.text),
+    );
+    expect(speechFormats.slice(-12)).toEqual(Array(12).fill('aac'));
+
+    await client.shutdown();
+    await expect(done).rejects.toThrow('Aborted');
   });
 });
